@@ -1,0 +1,17 @@
+dag_kwargs:
+  owner: airflow
+  depends_on_past: False
+  start_date: 0
+  email_on_failure: False
+  email_on_retry: False
+  retries: 1
+  retry_delay_minutes: 1
+  schedule_interval_days: 8
+
+
+op_kwargs_ids:
+  criterio_busqueda: '(structure_3d:true) AND (reviewed:true)'
+  limite: 10
+
+op_kwargs_info:
+  num_workers: 10

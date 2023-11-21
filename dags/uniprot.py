@@ -1,79 +1,82 @@
-# descargar_ids_proteinas_dag.py
-
+import os
 from datetime import timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.utils.dates import days_ago
-from urllib.parse import quote
-import requests
 import logging
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from model import Proteina, Base  # Asegúrate de cambiar 'tu_modulo_de_modelo' al nombre real de tu módulo
 
-# Configurar el registro
+from helpers.config.yaml import read_yaml_config
+from helpers.database.model import Base
+from tasks.uniprot import extraer_entradas, cargar_codigos_acceso
+
+
+# Configuración del logger para seguimiento.
 logger = logging.getLogger(__name__)
 
-# Configurar la conexión a la base de datos PostgreSQL
-engine = create_engine('postgresql+psycopg2://usuario:clave@postgres-extra:5432/BioData')
+# Obtención de variables de entorno para la conexión con la base de datos.
+DB_USERNAME = os.getenv('DB_USERNAME', 'usuario')
+DB_PASSWORD = os.getenv('DB_PASSWORD', 'clave')
+DB_HOST = os.getenv('DB_HOST', 'localhost')
+DB_PORT = os.getenv('DB_PORT', '5433')
+DB_NAME = os.getenv('DB_NAME', 'BioData')
+
+# Construcción de la URI de la base de datos y creación del motor de SQLAlchemy.
+DATABASE_URI = f"postgresql+psycopg2://{DB_USERNAME}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+engine = create_engine(DATABASE_URI)
 Session = sessionmaker(bind=engine)
 
-# Crear tabla si no existe
+# Creación de la estructura de la base de datos, si no existe.
 Base.metadata.create_all(engine)
 
-# Definición de la función para descargar y guardar IDs de proteínas
-def descargar_ids_proteinas(criterio_busqueda, limite, session):
-    criterio_busqueda_codificado = quote(criterio_busqueda)
-    url = f"https://rest.uniprot.org/uniprotkb/stream?query={criterio_busqueda_codificado}&format=list&size={limite}"
-    logger.info(f"URL solicitada: {url}")
-    try:
-        respuesta = requests.get(url)
-        respuesta.raise_for_status()
-        ids = respuesta.text.strip().split('\n')
-        logger.info(f"Número de IDs encontrados: {len(ids)}")
+# Lectura de la configuración del DAG desde un archivo YAML.
+config = read_yaml_config('config/uniprot.yaml')
+# Configuración de la fecha de inicio y retraso de reintento del DAG.
+config['default_args']['start_date'] = days_ago(config['default_args'].pop('start_date'))
+config['default_args']['retry_delay'] = timedelta(minutes=config['default_args'].pop('retry_delay_minutes'))
 
-        # Guardar en la base de datos
-        for id_proteina in ids:
-            proteina = Proteina(proteina_id=id_proteina)
-            session.add(proteina)
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        logger.error(f"Error: {e}")
 
-# Función envoltorio para la tarea de Airflow
-def tarea_func(**kwargs):
+# Definición de la función para la tarea de cargar códigos de acceso a proteínas.
+def tarea_cargar_codigos_acceso_proteinas(**kwargs):
     session = Session()
-    print('kwargs')
-    print(kwargs)
     try:
-        descargar_ids_proteinas(kwargs['criterio_busqueda'],kwargs['limite'], session=session)
+        cargar_codigos_acceso(kwargs['criterio_busqueda'], kwargs['limite'], session=session)
     finally:
         session.close()
 
-# Argumentos por defecto para el DAG
-default_args = {
-    'owner': 'airflow',
-    'depends_on_past': False,
-    'start_date': days_ago(0),
-    'email_on_failure': False,
-    'email_on_retry': False,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=1),
-}
 
-# Definición del DAG
+# Definición de la función para la tarea de descargar información de proteínas.
+def tarea_descargar_informacion_proteinas(**kwargs):
+    session = Session()
+    try:
+        extraer_entradas(session=session, max_workers=kwargs['num_workers'])
+    finally:
+        session.close()
+
+
+# Definición del DAG con sus argumentos por defecto, descripción y frecuencia.
 dag = DAG(
-    'descargar_ids_proteinas',
-    default_args=default_args,
+    'Extraer la información de UniProt para mantener un sistema de información en constante actualización',
+    default_args=config['dag_kwargs'],
     description='DAG para descargar IDs de proteínas y guardar en PostgreSQL',
-    schedule_interval=timedelta(days=1),
 )
 
-# Tarea para ejecutar la función
-tarea_descargar_ids = PythonOperator(
+# Creación de la tarea para descargar IDs de proteínas.
+tarea_cargar_codigos_acceso = PythonOperator(
     task_id='descargar_ids_proteinas',
-    python_callable=tarea_func,
-    op_kwargs={'criterio_busqueda': '(structure_3d:true) AND (reviewed:true)', 'limite': 10},
+    python_callable=tarea_cargar_codigos_acceso_proteinas,
+    op_kwargs=config['op_kwargs_ids'],
     dag=dag,
 )
+
+# Creación de la tarea para extraer información de las proteínas.
+tarea_descargar_informacion = PythonOperator(
+    task_id='descargar_informacion_proteinas',
+    python_callable=tarea_descargar_informacion_proteinas,
+    op_kwargs=config['op_kwargs_info'],
+    dag=dag,
+)
+
+# Definición del orden de las tareas en el DAG.
+tarea_cargar_codigos_acceso >> tarea_descargar_informacion
